@@ -9,6 +9,7 @@ import os
 import platform
 import tempfile
 from pathlib import Path
+import logging
 
 
 class SphericalConverter:
@@ -23,6 +24,9 @@ class SphericalConverter:
         self.ffmpeg_path = ffmpeg_path or 'ffmpeg'
         # Check for hardware acceleration support
         self.hw_accel = self._detect_hw_acceleration()
+        
+        # Set up logging
+        self.logger = logging.getLogger('SphericalConverter')
     
     def _detect_hw_acceleration(self) -> str:
         """Detect available hardware acceleration for the current platform.
@@ -229,29 +233,101 @@ class SphericalConverter:
             input_path = os.path.join(temp_dir, 'input_frame.jpg')
             cv2.imwrite(input_path, frame)
             
+            # Ensure input image exists and is readable
+            if not os.path.exists(input_path):
+                self.logger.error("Failed to save input frame for conversion")
+                return [frame]  # Return original frame if failed
+                
             # Convert to cubemap using FFmpeg's v360 filter
             cubemap_path = os.path.join(temp_dir, 'cubemap.jpg')
             
-            cmd = [
-                self.ffmpeg_path,
-                '-i', input_path,
-                '-vf', 'v360=e:c6x1',
-                '-q:v', '1',
-                cubemap_path
-            ]
+            # First attempt with standard command
+            success = self._try_convert_to_cubemap(input_path, cubemap_path)
             
-            try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                
-                # Read the cubemap image
+            # If failed, try with force dimensions that are known to work well
+            if not success:
+                self.logger.warning("Standard conversion failed, trying with adjusted dimensions")
+                # Resize the input image to dimensions that work well with FFmpeg's v360 filter
+                try:
+                    # Try a dimension that's divisible by common factors
+                    resized_path = os.path.join(temp_dir, 'resized_input.jpg')
+                    img = cv2.imread(input_path)
+                    # Make sure height and width are even numbers
+                    h, w = img.shape[:2]
+                    new_w = w if w % 2 == 0 else w - 1
+                    new_h = h if h % 2 == 0 else h - 1
+                    if new_w != w or new_h != h:
+                        img = cv2.resize(img, (new_w, new_h))
+                        cv2.imwrite(resized_path, img)
+                        self.logger.info(f"Resized input from {w}x{h} to {new_w}x{new_h}")
+                        success = self._try_convert_to_cubemap(resized_path, cubemap_path)
+                except Exception as e:
+                    self.logger.error(f"Error during resize attempt: {e}")
+                    success = False
+            
+            # If all FFmpeg approaches failed, try direct OpenCV conversion
+            if not success:
+                try:
+                    self.logger.warning("FFmpeg conversion failed, trying OpenCV direct conversion")
+                    # Try manual conversion using OpenCV
+                    img = cv2.imread(input_path)
+                    if img is None:
+                        return [frame]
+                    
+                    # Get dimensions
+                    h, w = img.shape[:2]
+                    
+                    # Create a 6-face cubemap (simple method - just divide the image)
+                    # This is a basic fallback - not as accurate as FFmpeg's v360 filter
+                    face_size = min(h // 3, w // 4)  # Make square faces
+                    
+                    # Create a new image to hold the cubemap (1 row, 6 columns)
+                    cubemap = np.zeros((face_size, face_size * 6, 3), dtype=np.uint8)
+                    
+                    # Fill with samples from the source image (basic sampling)
+                    for i in range(6):
+                        x_start = (i * w) // 6
+                        x_end = ((i + 1) * w) // 6
+                        y_start = 0
+                        y_end = h
+                        
+                        # Extract a region and resize to face size
+                        region = img[y_start:y_end, x_start:x_end]
+                        face = cv2.resize(region, (face_size, face_size))
+                        
+                        # Add to cubemap
+                        cubemap[:, i*face_size:(i+1)*face_size] = face
+                    
+                    # Save the resulting cubemap
+                    cv2.imwrite(cubemap_path, cubemap)
+                    success = os.path.exists(cubemap_path)
+                    
+                    if success:
+                        self.logger.info("Successfully created cubemap using OpenCV direct method")
+                except Exception as e:
+                    self.logger.error(f"OpenCV direct conversion failed: {e}")
+                    return [frame]  # Return original frame if all methods failed
+            
+            # Read the cubemap image if it was successfully created
+            if success and os.path.exists(cubemap_path):
                 cubemap = cv2.imread(cubemap_path)
                 if cubemap is None:
-                    print("Error: Failed to read cubemap image")
+                    self.logger.error("Error: Failed to read cubemap image")
                     return [frame]  # Return original frame if failed
                 
+                # Ensure cubemap width is divisible by 6
+                height, width, _ = cubemap.shape
+                if width % 6 != 0:
+                    self.logger.warning(f"Cubemap width {width} is not divisible by 6, adjusting")
+                    # Adjust width to be divisible by 6
+                    new_width = (width // 6) * 6
+                    cubemap = cv2.resize(cubemap, (new_width, height))
+                    # Re-save the adjusted cubemap
+                    cv2.imwrite(cubemap_path, cubemap)
+                    width = new_width
+                
                 # Split the cubemap into 6 individual faces
-                height = cubemap.shape[0]
-                face_width = cubemap.shape[1] // 6
+                face_width = width // 6
                 
                 faces = []
                 for i in range(6):
@@ -259,11 +335,53 @@ class SphericalConverter:
                     faces.append(face)
                 
                 # If successful, return all 6 faces
-                return faces
-                
-            except subprocess.SubprocessError as e:
-                print(f"Error converting to cubemap: {e}")
-                return [frame]  # Return original frame if failed
+                if len(faces) == 6:
+                    return faces
+            
+            # If we got here, something went wrong
+            self.logger.error("Cubemap conversion failed with all methods")
+            return [frame]  # Return original frame as fallback
+    
+    def _try_convert_to_cubemap(self, input_path: str, output_path: str) -> bool:
+        """Try to convert an equirectangular image to cubemap using FFmpeg.
+        
+        Args:
+            input_path: Path to input image
+            output_path: Path to save cubemap image
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-vf', 'v360=e:c6x1',
+                '-q:v', '1',
+                output_path
+            ]
+            
+            # Run FFmpeg
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # Check if file was created
+            if os.path.exists(output_path):
+                # Verify the cubemap can be read
+                img = cv2.imread(output_path)
+                if img is not None:
+                    return True
+                else:
+                    self.logger.error("Created cubemap file but cannot read it")
+            else:
+                self.logger.error("FFmpeg did not create cubemap file")
+            
+            return False
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"FFmpeg error: {e.stderr.decode() if hasattr(e, 'stderr') else str(e)}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error in cubemap conversion: {str(e)}")
+            return False
     
     def process_360_frame(self, frame: np.ndarray) -> List[np.ndarray]:
         """Process a 360° frame and return multiple perspective views.

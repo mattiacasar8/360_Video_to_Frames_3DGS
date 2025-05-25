@@ -124,6 +124,9 @@ class VideoListWidget(QListWidget):
                 # Create item
                 item = QListWidgetItem(self)
                 
+                # Set video path in UserRole data for analysis
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                
                 # Create widget
                 video_widget = VideoListItem(path)
                 
